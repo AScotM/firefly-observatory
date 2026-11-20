@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,34 +24,37 @@ import (
 )
 
 type Config struct {
-	Agents    int     `json:"agents"`
-	FPS       int     `json:"fps"`
-	Width     int     `json:"width"`
-	Height    int     `json:"height"`
-	Seed      int64   `json:"seed"`
-	Palette   string  `json:"palette"`
-	Mode      string  `json:"mode"`
-	Coupling  float64 `json:"coupling"`
-	Radius    float64 `json:"radius"`
-	Speed     float64 `json:"speed"`
-	Noise     float64 `json:"noise"`
-	Trails    float64 `json:"trails"`
-	Telemetry bool    `json:"telemetry"`
-	Duration  float64 `json:"duration"`
-	Output    string  `json:"output"`
-	Frames    int     `json:"frames"`
-	Density   float64 `json:"density"`
-	Border    bool    `json:"border"`
-	Stats     bool    `json:"stats"`
-	ASCII     bool    `json:"ascii"`
-	Record    string  `json:"record"`
-	Snapshot  string  `json:"snapshot"`
-	Restore   string  `json:"restore"`
-	Headless  bool    `json:"headless"`
-	Quiet     bool    `json:"quiet"`
-	Wind      float64 `json:"wind"`
-	Gravity   float64 `json:"gravity"`
-	Bloom     float64 `json:"bloom"`
+	Agents     int     `json:"agents"`
+	FPS        int     `json:"fps"`
+	Width      int     `json:"width"`
+	Height     int     `json:"height"`
+	Seed       int64   `json:"seed"`
+	Palette    string  `json:"palette"`
+	Mode       string  `json:"mode"`
+	Coupling   float64 `json:"coupling"`
+	Radius     float64 `json:"radius"`
+	Speed      float64 `json:"speed"`
+	Noise      float64 `json:"noise"`
+	Trails     float64 `json:"trails"`
+	Telemetry  bool    `json:"telemetry"`
+	Duration   float64 `json:"duration"`
+	Output     string  `json:"output"`
+	Frames     int     `json:"frames"`
+	Density    float64 `json:"density"`
+	Border     bool    `json:"border"`
+	Stats      bool    `json:"stats"`
+	ASCII      bool    `json:"ascii"`
+	Record     string  `json:"record"`
+	Snapshot   string  `json:"snapshot"`
+	Restore    string  `json:"restore"`
+	Headless   bool    `json:"headless"`
+	Quiet      bool    `json:"quiet"`
+	Wind       float64 `json:"wind"`
+	Gravity    float64 `json:"gravity"`
+	Bloom      float64 `json:"bloom"`
+	Eco        bool    `json:"eco"`
+	CPUProfile string  `json:"cpu_profile,omitempty"`
+	MemProfile string  `json:"mem_profile,omitempty"`
 }
 type Agent struct {
 	X         float64 `json:"x"`
@@ -94,6 +98,9 @@ type World struct {
 	MeanEnergy float64
 	Grid       map[int][]int
 	GridSize   float64
+	Next       []Agent
+	GridCols   int
+	GridRows   int
 }
 type Recorder struct {
 	File    *os.File
@@ -180,7 +187,7 @@ func parse() (string, Config, error) {
 	fs.Float64Var(&c.Noise, "noise", c.Noise, "stochastic motion strength")
 	fs.Float64Var(&c.Trails, "trails", c.Trails, "persistence from 0 to 0.99")
 	fs.BoolVar(&c.Telemetry, "telemetry", c.Telemetry, "modulate with Linux CPU, memory and disk activity")
-	fs.Float64Var(&c.Duration, "duration", c.Duration, "stop after seconds (0 = unlimited)")
+	fs.Float64Var(&c.Duration, "duration", c.Duration, "stop after wall-clock seconds (0 = unlimited)")
 	fs.StringVar(&c.Output, "output", c.Output, "output path for render or report")
 	fs.IntVar(&c.Frames, "frames", c.Frames, "frame limit (0 = unlimited)")
 	fs.Float64Var(&c.Density, "density", c.Density, "brightness multiplier")
@@ -195,6 +202,9 @@ func parse() (string, Config, error) {
 	fs.Float64Var(&c.Wind, "wind", c.Wind, "horizontal wind strength")
 	fs.Float64Var(&c.Gravity, "gravity", c.Gravity, "attraction to canvas center")
 	fs.Float64Var(&c.Bloom, "bloom", c.Bloom, "glow radius multiplier")
+	fs.BoolVar(&c.Eco, "eco", c.Eco, "low-power mode: cap rendering at 12 FPS and agent count at 240")
+	fs.StringVar(&c.CPUProfile, "cpuprofile", "", "write CPU profile")
+	fs.StringVar(&c.MemProfile, "memprofile", "", "write heap profile")
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
 		return "", c, err
@@ -248,52 +258,76 @@ func newWorld(c Config) *World {
 	}
 	w := &World{C: c, RNG: rand.New(rand.NewSource(c.Seed)), Grid: make(map[int][]int)}
 	w.Agents = make([]Agent, c.Agents)
+	w.Next = make([]Agent, c.Agents)
 	for i := range w.Agents {
 		w.Agents[i] = Agent{X: w.RNG.Float64() * float64(c.Width), Y: w.RNG.Float64() * float64(c.Height), VX: (w.RNG.Float64() - .5) * 2, VY: (w.RNG.Float64() - .5) * 2, Phase: w.RNG.Float64() * 2 * math.Pi, Frequency: 0.65 + w.RNG.Float64()*1.3, Energy: 0.5 + w.RNG.Float64()*.5, Size: 0.6 + w.RNG.Float64()*.8, Family: w.RNG.Intn(4)}
 	}
 	return w
 }
 func (w *World) buildGrid() {
-	w.Grid = make(map[int][]int, len(w.Agents)/3)
+	for k, v := range w.Grid {
+		w.Grid[k] = v[:0]
+	}
 	w.GridSize = math.Max(1, w.C.Radius)
-	cols := int(math.Ceil(float64(w.C.Width) / w.GridSize))
+	w.GridCols = int(math.Ceil(float64(w.C.Width) / w.GridSize))
+	w.GridRows = int(math.Ceil(float64(w.C.Height) / w.GridSize))
 	for i, a := range w.Agents {
 		x := int(a.X / w.GridSize)
 		y := int(a.Y / w.GridSize)
-		w.Grid[y*cols+x] = append(w.Grid[y*cols+x], i)
+		if x >= w.GridCols {
+			x = w.GridCols - 1
+		}
+		if y >= w.GridRows {
+			y = w.GridRows - 1
+		}
+		key := y*w.GridCols + x
+		w.Grid[key] = append(w.Grid[key], i)
 	}
 }
+
 func (w *World) neighbors(i int, fn func(int, float64, float64, float64)) {
 	a := w.Agents[i]
-	cell := w.GridSize
-	cols := int(math.Ceil(float64(w.C.Width) / cell))
-	rows := int(math.Ceil(float64(w.C.Height) / cell))
-	cx := int(a.X / cell)
-	cy := int(a.Y / cell)
-	seen := make(map[int]bool, 16)
+	cx := int(a.X / w.GridSize)
+	cy := int(a.Y / w.GridSize)
+	var cells [9]int
+	n := 0
+	radius2 := w.C.Radius * w.C.Radius
 	for dy := -1; dy <= 1; dy++ {
+		y := (cy + dy + w.GridRows) % w.GridRows
 		for dx := -1; dx <= 1; dx++ {
-			x := (cx + dx + cols) % cols
-			y := (cy + dy + rows) % rows
-			for _, j := range w.Grid[y*cols+x] {
-				if i == j || seen[j] {
+			x := (cx + dx + w.GridCols) % w.GridCols
+			key := y*w.GridCols + x
+			duplicate := false
+			for k := 0; k < n; k++ {
+				if cells[k] == key {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			cells[n] = key
+			n++
+			for _, j := range w.Grid[key] {
+				if i == j {
 					continue
 				}
-				seen[j] = true
 				b := w.Agents[j]
 				xx := torusDelta(a.X, b.X, float64(w.C.Width))
 				yy := torusDelta(a.Y, b.Y, float64(w.C.Height))
-				d := math.Hypot(xx, yy)
-				if d < w.C.Radius {
-					fn(j, xx, yy, d)
+				d2 := xx*xx + yy*yy
+				if d2 < radius2 {
+					fn(j, xx, yy, math.Sqrt(d2))
 				}
 			}
 		}
 	}
 }
+
 func (w *World) step(dt float64) {
 	w.buildGrid()
-	next := make([]Agent, len(w.Agents))
+	next := w.Next
 	sx, sy, energy := 0., 0., 0.
 	c := w.C
 	cx := float64(c.Width) / 2
@@ -363,7 +397,7 @@ func (w *World) step(dt float64) {
 		sy += math.Sin(a.Phase)
 		energy += a.Energy
 	}
-	w.Agents = next
+	w.Agents, w.Next = w.Next, w.Agents
 	w.T += dt
 	w.Frame++
 	w.Order = math.Hypot(sx, sy) / float64(len(next))
@@ -393,7 +427,9 @@ func (f *Field) glow(x, y, r float64, c Color, strength float64) {
 			if px < 0 || px >= f.W {
 				continue
 			}
-			d2 := math.Pow(float64(px)-x, 2) + math.Pow((float64(py)-y)*1.7, 2)
+			xx := float64(px) - x
+			yy := (float64(py) - y) * 1.7
+			d2 := xx*xx + yy*yy
 			v := strength * math.Exp(-d2/(2*r*r))
 			p := &f.Data[py*f.W+px]
 			p.R = clamp(p.R+c.R*v, 0, 255)
@@ -444,9 +480,11 @@ func ansi(f *Field, c Config, w *World) []byte {
 				glyph = "✶"
 			}
 			r, g, bl := int(p.R), int(p.G), int(p.B)
-			code := fmt.Sprintf("\x1b[38;2;%d;%d;%dm", r, g, bl)
+			code := strconv.Itoa(r) + ";" + strconv.Itoa(g) + ";" + strconv.Itoa(bl)
 			if code != last {
+				b.WriteString("\x1b[38;2;")
 				b.WriteString(code)
+				b.WriteByte('m')
 				last = code
 			}
 			b.WriteString(glyph)
@@ -653,6 +691,36 @@ func info() {
 	fmt.Printf("Firefly Observatory 1.0.0\nGo %s | %s/%s\nStandard library only | GPL-3.0-only\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }
 func run(command string, c Config) error {
+	if c.CPUProfile != "" {
+		f, err := os.Create(c.CPUProfile)
+		if err != nil {
+			return err
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			f.Close()
+			return err
+		}
+		defer func() { pprof.StopCPUProfile(); f.Close() }()
+	}
+	if c.MemProfile != "" {
+		defer func() {
+			f, err := os.Create(c.MemProfile)
+			if err == nil {
+				runtime.GC()
+				_ = pprof.WriteHeapProfile(f)
+				_ = f.Close()
+			}
+		}()
+	}
+	if c.Eco {
+		if c.FPS > 12 {
+			c.FPS = 12
+		}
+		if c.Agents > 240 && c.Restore == "" {
+			c.Agents = 240
+		}
+	}
+
 	if command == "palettes" {
 		printPalettes()
 		return nil
@@ -702,6 +770,7 @@ func run(command string, c Config) error {
 			return e
 		}
 		w.Agents = s.Agents
+		w.Next = make([]Agent, len(w.Agents))
 		w.T = s.Time
 		w.Frame = s.Frame
 		for i := range w.Agents {
@@ -726,6 +795,7 @@ func run(command string, c Config) error {
 	next := time.Now()
 	lastPoll := -1.
 	initialFrame := w.Frame
+	startWall := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -735,12 +805,12 @@ func run(command string, c Config) error {
 		if c.Frames > 0 && w.Frame-initialFrame >= c.Frames {
 			break
 		}
-		if c.Duration > 0 && w.T >= c.Duration {
+		if c.Duration > 0 && time.Since(startWall).Seconds() >= c.Duration {
 			break
 		}
-		if c.Telemetry && (lastPoll < 0 || w.T-lastPoll >= 1) {
-			w.pollTelemetry(1)
-			lastPoll = w.T
+		if c.Telemetry && (lastPoll < 0 || time.Since(startWall).Seconds()-lastPoll >= 1) {
+			w.pollTelemetry(math.Max(0.001, time.Since(startWall).Seconds()-lastPoll))
+			lastPoll = time.Since(startWall).Seconds()
 		}
 		w.step(dt)
 		w.paint(field)
@@ -757,8 +827,18 @@ func run(command string, c Config) error {
 			} else if delay < -interval*3 {
 				next = time.Now()
 			}
-		} else if command == "run" && c.Frames == 0 && c.Duration == 0 {
-			return errors.New("headless run requires --frames or --duration")
+		} else if command == "run" && c.Headless {
+			if c.Frames == 0 && c.Duration == 0 {
+				return errors.New("headless run requires --frames or --duration")
+			}
+			if c.Eco {
+				next = next.Add(interval)
+				if delay := time.Until(next); delay > 0 {
+					time.Sleep(delay)
+				} else if delay < -interval*3 {
+					next = time.Now()
+				}
+			}
 		}
 	}
 finished:
